@@ -10,17 +10,19 @@ import net.minecraft.network.syncher.EntityDataAccessor;
 import net.minecraft.network.syncher.EntityDataSerializers;
 import net.minecraft.network.syncher.SynchedEntityData;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.util.Mth;
 import net.minecraft.world.damagesource.DamageSource;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.entity.LivingEntity;
-import net.minecraft.world.entity.ai.attributes.AttributeModifier;
 import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.entity.projectile.ItemSupplier;
 import net.minecraft.world.entity.projectile.Projectile;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.component.ItemAttributeModifiers;
+import net.minecraft.world.item.enchantment.EnchantmentHelper;
 import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.storage.ValueInput;
@@ -38,21 +40,26 @@ import org.jspecify.annotations.Nullable;
  * <p>Flight is completely ballistic-free: no gravity, no drag, one straight line along the launch
  * vector. Collision is resolved on the server only, and every living entity whose hitbox is crossed
  * by the swept segment takes the damage once; the projectile is not stopped by the first victim.
- * The first block hit consumes the projectile and leaves a pickable spear behind.
+ *
+ * <p>The first block hit ends the flight: the spear plants itself into the surface at that exact
+ * spot, tilted so it points into the ground, and stays there. It is never consumed, never dropped
+ * as an item and never picked back up.
  */
 public class ThrownSpear extends Projectile implements ItemSupplier {
     /** 1.5x the stack's attack-damage attribute value, as specified. */
     public static final float DAMAGE_MULTIPLIER = 1.5F;
     /** Launch speed in blocks per tick. */
     public static final float LAUNCH_SPEED = 2.5F;
-    /** Hard cap on lifetime so a missed shot cannot fly forever. */
-    private static final int MAX_LIFETIME_TICKS = 200;
+    /** Hard cap on flight time so a shot that never hits anything still comes down somewhere. */
+    private static final int MAX_FLIGHT_TICKS = 200;
     private static final double HITBOX_MARGIN = 0.3D;
+    private static final float MAX_PITCH = 89.0F;
 
     private static final EntityDataAccessor<ItemStack> DATA_ITEM_STACK =
             SynchedEntityData.defineId(ThrownSpear.class, EntityDataSerializers.ITEM_STACK);
 
-    private boolean consumed;
+    /** True once the spear has planted itself; the flight code is skipped from then on. */
+    private boolean landed;
 
     public ThrownSpear(EntityType<? extends ThrownSpear> type, Level level) {
         super(type, level);
@@ -83,28 +90,34 @@ public class ThrownSpear extends Projectile implements ItemSupplier {
     protected void addAdditionalSaveData(ValueOutput output) {
         super.addAdditionalSaveData(output);
         output.store("Item", ItemStack.CODEC, this.getItem());
+        output.putBoolean("Landed", this.landed);
     }
 
     @Override
     protected void readAdditionalSaveData(ValueInput input) {
         super.readAdditionalSaveData(input);
         this.setItem(input.<ItemStack>read("Item", ItemStack.CODEC).orElse(ItemStack.EMPTY));
+        this.landed = input.getBooleanOr("Landed", false);
     }
 
     @Override
     public void tick() {
         super.tick();
 
-        if (this.consumed) {
-            return;
-        }
-        if (!this.level().isClientSide() && this.tickCount > MAX_LIFETIME_TICKS) {
-            this.discard();
+        // The whole simulation is server side; the client only receives position and rotation.
+        if (this.level().isClientSide() || this.landed) {
             return;
         }
 
         Vec3 movement = this.getDeltaMovement();
         if (movement.lengthSqr() < 1.0E-7D) {
+            // Nothing left to travel: plant where it stands rather than leaving a floating spear.
+            this.plant(this.position());
+            return;
+        }
+
+        if (this.tickCount > MAX_FLIGHT_TICKS) {
+            this.plant(this.position());
             return;
         }
 
@@ -124,18 +137,41 @@ public class ThrownSpear extends Projectile implements ItemSupplier {
         this.setPos(to.x, to.y, to.z);
 
         for (EntityHitResult hit : hits) {
-            if (this.consumed) {
-                break;
-            }
             this.hitEntity(hit.getEntity());
         }
 
         if (blockHit.getType() != HitResult.Type.MISS) {
-            this.onHitBlock(blockHit);
+            // The final landing spot is the block impact point, even after piercing other entities.
+            this.plant(blockHit.getLocation());
             return;
         }
 
         this.setDeltaMovement(movement);
+    }
+
+    /**
+     * Freezes the spear into the surface at {@code landing}: it stops moving, keeps the orientation
+     * it arrived with and is tilted so the head points into the ground.
+     */
+    private void plant(Vec3 landing) {
+        Vec3 travel = this.getDeltaMovement();
+        float yaw = this.getYRot();
+        float pitch = this.getXRot();
+        if (travel.lengthSqr() > 1.0E-7D) {
+            yaw = (float) (Mth.atan2(travel.x, travel.z) * 180.0F / (float) Math.PI);
+            double horizontal = travel.horizontalDistance();
+            pitch = (float) (Mth.atan2(travel.y, horizontal) * 180.0F / (float) Math.PI);
+        }
+
+        this.landed = true;
+        this.setDeltaMovement(Vec3.ZERO);
+        this.setPos(landing.x, landing.y, landing.z);
+        // Flipped like the vanilla trident pose, so the tip is buried and the shaft sticks out.
+        this.setYRot(yaw + 180.0F);
+        this.setXRot(Mth.clamp(-pitch, -MAX_PITCH, MAX_PITCH));
+        this.yRotO = this.getYRot();
+        this.xRotO = this.getXRot();
+        this.setOldPosAndRot();
     }
 
     /** Every entity hitbox crossed by {@code from -> to}, nearest first, bounded by the block hit. */
@@ -194,22 +230,8 @@ public class ThrownSpear extends Projectile implements ItemSupplier {
                 }
             }
             // Fire aspect / knockback style post-hit enchantment effects from the thrown spear.
-            net.minecraft.world.item.enchantment.EnchantmentHelper.doPostAttackEffectsWithItemSource(
-                    serverLevel, target, source, this.getItem());
+            EnchantmentHelper.doPostAttackEffectsWithItemSource(serverLevel, target, source, this.getItem());
         }
-    }
-
-    @Override
-    protected void onHitBlock(BlockHitResult hit) {
-        if (this.level() instanceof ServerLevel serverLevel) {
-            this.consumed = true;
-            // Same recovery rule as the vanilla trident: the spear survives the impact on the ground.
-            ItemStack drop = this.getItem().copyWithCount(1);
-            if (!drop.isEmpty()) {
-                this.spawnAtLocation(serverLevel, drop, 0.1F);
-            }
-        }
-        this.discard();
     }
 
     /**
@@ -220,7 +242,7 @@ public class ThrownSpear extends Projectile implements ItemSupplier {
         ItemStack spear = this.getItem();
         ItemAttributeModifiers modifiers =
                 spear.getComponents().getOrDefault(DataComponents.ATTRIBUTE_MODIFIERS, ItemAttributeModifiers.EMPTY);
-        double base = modifiers.compute(Attributes.ATTACK_DAMAGE, 0.0D, net.minecraft.world.entity.EquipmentSlot.MAINHAND);
+        double base = modifiers.compute(Attributes.ATTACK_DAMAGE, 0.0D, EquipmentSlot.MAINHAND);
         return (float) (base * DAMAGE_MULTIPLIER);
     }
 
