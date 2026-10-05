@@ -10,6 +10,7 @@ import net.minecraft.network.syncher.EntityDataAccessor;
 import net.minecraft.network.syncher.EntityDataSerializers;
 import net.minecraft.network.syncher.SynchedEntityData;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.sounds.SoundEvents;
 import net.minecraft.util.Mth;
 import net.minecraft.world.damagesource.DamageSource;
 import net.minecraft.world.entity.Entity;
@@ -251,9 +252,45 @@ public class ThrownSpear extends Projectile implements ItemSupplier {
         return distanceSqr < 4096.0D;
     }
 
+    /**
+     * Defence in depth: the vanilla render dispatcher dereferences the renderer without a null
+     * check, so an entity type that somehow has no renderer crashes the whole frame. If this mod's
+     * client renderer did not load (wrong dist, missing client wiring), skip rendering instead of
+     * taking the game down. The renderer is normally registered in {@code SpearPlusClient}.
+     */
+    @Override
+    public boolean shouldRender(double camX, double camY, double camZ) {
+        return net.minecraft.client.Minecraft.getInstance().getEntityRenderDispatcher().getRenderer(this) != null;
+    }
+
+    /**
+     * A spear that has come to rest can be taken back by walking into it, the way a dropped item
+     * works. While it is still flying it is not pickable, so it cannot be grabbed out of the air and
+     * it still ignores its owner.
+     */
+    @Override
+    public void playerTouch(Player player) {
+        if (!this.landed || this.level().isClientSide() || !player.isAlive() || player.isSpectator()) {
+            return;
+        }
+
+        ItemStack spear = this.getItem();
+        if (spear.isEmpty()) {
+            this.discard();
+            return;
+        }
+
+        ItemStack toPickUp = spear.copyWithCount(1);
+        if (player.getInventory().add(toPickUp)) {
+            player.take(this, 1);
+            player.playSound(SoundEvents.ITEM_PICKUP, 0.2F, ((this.random.nextFloat() - this.random.nextFloat()) * 0.7F + 1.0F) * 2.0F);
+            this.discard();
+        }
+    }
+
     @Override
     public boolean isPickable() {
-        return false;
+        return true;
     }
 
     @Override

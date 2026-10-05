@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.0.3
+
+- 修复渲染器从未注册导致渲染帧崩溃的问题。
+  根因：NeoForge 26.3 的 `@EventBusSubscriber` 已没有 `bus` 属性，只会把监听器注入 **game bus**，
+  而 `EntityRenderersEvent.RegisterRenderers` 是 mod bus 事件，注册静默失效，
+  `thrown_spear` 没有渲染器 → `EntityRenderDispatcher` 解引用 null 崩溃。
+  现改为在 `@Mod` 构造函数里用 `modEventBus.addListener` 显式注册，并按 `FMLEnvironment.getDist()` 判定客户端。
+  另外给 `ThrownSpear#shouldRender` 加了兜底，渲染器缺失时跳过渲染而不是崩游戏。
+- 修复投出的长矛外观抖动：原先用 `ItemDisplayContext.GROUND` 解析模型，
+  而原版长矛物品模型对 `gui/ground/fixed/on_shelf` 选用的是平面背包贴图，
+  在三维空间里旋转就像一块翻来翻去的卡片。改用 `ItemDisplayContext.NONE` 解析到
+  3D 的 `*_spear_in_hand` 模型，并套用与 `ThrownTridentRenderer` 完全相同的姿态公式。
+- 新增回收：落地后的长矛可以走近拾取（`playerTouch`），飞行中不可拾取，背包满时不消失。
+
 ## 1.0.2
 
 - 修复潜行 + 右键无法进入蓄力的问题。
