@@ -1,94 +1,121 @@
 package com.spearplus;
 
 import com.spearplus.entity.ThrownSpear;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.UUID;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.sounds.SoundEvents;
 import net.minecraft.sounds.SoundSource;
 import net.minecraft.tags.ItemTags;
 import net.minecraft.world.InteractionHand;
-import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.item.ItemStack;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.neoforge.event.entity.living.LivingEntityUseItemEvent;
+import net.neoforged.neoforge.event.entity.player.PlayerEvent;
+import net.neoforged.neoforge.event.tick.PlayerTickEvent;
 
 /**
  * Turns "hold shift + right-click with a vanilla spear" into a charge, and a full charge into a
  * throw.
  *
- * <p>The charge deliberately rides on the vanilla item-use state instead of a private timer:
- * {@code LivingEntity#isUsingItem()} and {@code getTicksUsingItem()} are what drive the vanilla
- * spear arm animation and the vanilla in-hand charge animation
- * ({@code SpearAnimations} reads {@code HumanoidRenderState#ticksUsingItem}), and they are what the
- * client already sends back to the server through the vanilla release packet. Re-implementing that
- * timing by hand produced a wrong arm pose and an extra input payload for no benefit.
+ * <p>The charge is timed by the server from the raw input reported by
+ * {@link com.spearplus.network.SpearChargePayload}, not from the vanilla use-item state. That state
+ * proved unusable in practice: the client's {@code LocalPlayer#isUsingItem} toggles every tick while
+ * the key is held, so {@code getTicksUsingItem()} never accumulates and the release never reaches
+ * the throw threshold.
  *
- * <p>What this class adds on top:
+ * <p>The vanilla use action is still allowed to run, because it is what produces the vanilla spear
+ * arm pose and in-hand charge animation. Two things are layered on top:
  * <ul>
- *   <li>the kinetic-weapon melee damage is suppressed while a throw charge is running, so charging
+ *   <li>the vanilla kinetic-weapon melee damage is suppressed while a charge is running, so charging
  *       does not also stab whatever is in front of the player;</li>
- *   <li>the charge only counts while the player is sneaking and holding a spear;</li>
- *   <li>releasing a full charge throws the spear.</li>
+ *   <li>releasing a charge that ran long enough throws the spear.</li>
  * </ul>
  *
- * <p>A plain right-click is never intercepted, so the vanilla spear raise and the throw cannot
- * fight each other: the raise is exactly the same use action, just not converted into a throw when
- * the player is not sneaking.
+ * <p>A plain right-click is never intercepted, so the vanilla spear raise and the throw cannot fight
+ * each other: the raise is the same use action, just not converted into a throw without shift.
  */
 public final class SpearThrowHandler {
     /** Ticks of charging required before the release throws. Matches the vanilla bow. */
     public static final int CHARGE_TICKS = 20;
 
+    /** Server tick at which each player's charge started, keyed by player UUID. */
+    private static final Map<UUID, Integer> CHARGE_START = new HashMap<>();
+
     private SpearThrowHandler() {
     }
 
-    /**
-     * A throw charge is running: the spear is being used and the player is sneaking.
-     *
-     * <p>Both halves matter. Sneaking alone would also match a player who is just standing still with
-     * the spear raised, and using alone would match the plain vanilla raise.
-     */
-    private static boolean isCharging(LivingEntity entity) {
-        return entity.isShiftKeyDown()
-                && entity.isUsingItem()
-                && isThrowableSpear(entity.getUseItem());
+    /** The charge only counts while the player is alive, sneaking and holding a spear. */
+    private static boolean canCharge(ServerPlayer player) {
+        return player.isAlive() && !player.isSpectator()
+                && player.isShiftKeyDown()
+                && isThrowableSpear(player.getMainHandItem());
     }
 
     /**
-     * Suppresses the vanilla kinetic-weapon damage while the player is charging a throw, so the
-     * charge does not double as a melee stab. Cancelling this event also skips
-     * {@code ItemStack#onUseTick}, which is where the kinetic damage is applied on the server.
+     * Starts a charge when the client reports the shift + right-click press.
+     *
+     * <p>Idempotent on purpose: the client re-sends the press edge for as long as the keys are held,
+     * and an already running charge must keep its original start tick or it would never fill up.
+     */
+    public static void startCharge(ServerPlayer player) {
+        if (!canCharge(player) || CHARGE_START.containsKey(player.getUUID())) {
+            return;
+        }
+        CHARGE_START.put(player.getUUID(), player.level().getServer().getTickCount());
+    }
+
+    /** Releases the charge; a charge held long enough throws, anything shorter does nothing. */
+    public static void stopCharge(ServerPlayer player) {
+        Integer start = CHARGE_START.remove(player.getUUID());
+        if (start == null) {
+            return;
+        }
+        int held = player.level().getServer().getTickCount() - start;
+        if (held >= CHARGE_TICKS) {
+            throwSpear(player, InteractionHand.MAIN_HAND);
+        }
+    }
+
+    /**
+     * Suppresses the vanilla kinetic-weapon damage while a throw charge is running, so the charge
+     * does not double as a melee stab. Cancelling this event also skips {@code ItemStack#onUseTick},
+     * which is where the kinetic damage is applied on the server.
      */
     @SubscribeEvent
     public static void onUseTick(LivingEntityUseItemEvent.Tick event) {
-        if (!(event.getEntity() instanceof ServerPlayer)) {
+        if (!(event.getEntity() instanceof ServerPlayer player)) {
             return;
         }
-        if (isCharging(event.getEntity())) {
+        if (CHARGE_START.containsKey(player.getUUID()) && isThrowableSpear(event.getItem())) {
             event.setCanceled(true);
         }
     }
 
-    /** A released charge that ran long enough throws the spear. */
+    /**
+     * Safety net for a charge that was never explicitly released (the player stopped sneaking, swapped
+     * the spear away, died, or the release edge was lost): drop it instead of leaving it stuck.
+     */
     @SubscribeEvent
-    public static void onStopUsing(LivingEntityUseItemEvent.Stop event) {
-        LivingEntity entity = event.getEntity();
-        if (!(entity instanceof ServerPlayer player)) {
+    public static void onPlayerTick(PlayerTickEvent.Post event) {
+        if (!(event.getEntity() instanceof ServerPlayer player)) {
             return;
         }
-        if (!isThrowableSpear(event.getItem()) || !entity.isShiftKeyDown()) {
-            return;
+        if (CHARGE_START.containsKey(player.getUUID()) && !canCharge(player)) {
+            CHARGE_START.remove(player.getUUID());
         }
-        if (entity.getTicksUsingItem() < CHARGE_TICKS) {
-            // Released too early: the spear simply stays where it was, untouched and uncooled.
-            return;
-        }
-        throwSpear(player, event.getHand());
+    }
+
+    @SubscribeEvent
+    public static void onPlayerLoggedOut(PlayerEvent.PlayerLoggedOutEvent event) {
+        CHARGE_START.remove(event.getEntity().getUUID());
     }
 
     private static void throwSpear(ServerPlayer player, InteractionHand hand) {
         ItemStack stack = player.getItemInHand(hand);
-        if (!isThrowableSpear(stack) || !(player.level() instanceof ServerLevel serverLevel)) {
+        if (!canCharge(player) || !isThrowableSpear(stack) || !(player.level() instanceof ServerLevel serverLevel)) {
             return;
         }
 
@@ -113,3 +140,4 @@ public final class SpearThrowHandler {
         return !stack.isEmpty() && stack.is(ItemTags.SPEARS);
     }
 }
+

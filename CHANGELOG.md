@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.0.5
+
+- 修复 Shift + 右键蓄力动画闪烁、且永远射不出去的问题。
+  根因：上一版把蓄力计时挂在原版使用状态上，但实测该状态不可用——
+  客户端 `LocalPlayer#isUsingItem` 在按住期间**每 tick 在 true/false 之间翻转**
+  （`LocalPlayer` 用 `startedUsingItem` 本地标志，并会被服务端同步包反复纠正），
+  于是 `getTicksUsingItem()` 永远停在 1，蓄力攒不满，动画也每 tick 重置一次（表现为闪烁）。
+  另外服务端读到的 `isShiftKeyDown()` 在蓄力期间恒为 false，进一步让投掷判定失效。
+- 改为由客户端上报**原始按键状态**（`spearplus:spear_charge` 载荷，仅在边沿发送），
+  服务端用 tick 差自行计时，不再依赖原版使用状态。
+- 原版使用动作仍然放行（它提供原版手臂姿态与手持蓄力动画）；
+  蓄力期间在服务端取消 `LivingEntityUseItemEvent.Tick` 以抑制原版突刺伤害。
+
 ## 1.0.4
 
 - 修复插在建筑上的长矛会跟随玩家视角转动的问题。

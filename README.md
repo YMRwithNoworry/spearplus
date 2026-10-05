@@ -85,7 +85,7 @@ gradlew.bat build
 JAVA_HOME=/path/to/jdk-25 ./gradlew build
 ```
 
-产物：`build/libs/spearplus-1.0.4.jar`
+产物：`build/libs/spearplus-1.0.5.jar`
 
 调试运行：
 
