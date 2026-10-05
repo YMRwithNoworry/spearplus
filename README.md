@@ -15,18 +15,35 @@
 | 落地 | 命中方块后**不再消失**：长矛模型固定在最终落点，按落地姿态斜插在地面/墙面上，并永久保留在场景中 |
 | 近战 | 长矛原有的近战伤害、突刺/击退/下马行为与附魔效果全部保持原样 |
 
+## 输入与蓄力的处理方式
+
+这是本模组唯一有技巧的部分，记录在此以免后续改动踩坑。
+
+**为什么不能复用原版的使用状态**：原版长矛的“举矛”是由 `Item.use` → `player.startUsingItem` 驱动的。
+需求要求 Shift + 右键时**不出现**举矛动作，因此这个输入必须在 `Item.use` 之前被取消。
+而一旦取消，原版的使用状态（`LivingEntity#isUsingItem` / `getTicksUsingItem`）就永远不会被置位，
+也就无法用来判断“玩家松手了没有”或“蓄力了多久”。**取消原版使用 与 依赖原版使用状态计时，二者不可兼得。**
+
+**因此蓄力有自己的一套生命周期**：
+
+1. 客户端 `SpearThrowClient` 直接读原始按键（`options.keyUse` + 潜行状态 + 主手是否为长矛），
+   在“按住/松开”的**边沿**各发一次 `spearplus:spear_charge` 载荷（`SpearChargePayload`）。
+2. 客户端同时取消 `RightClickItem`，服务端 `SpearThrowHandler.onRightClickItem` 也取消一次，
+   于是这条输入不会触发原版 `Item.use`，举矛动作彻底不出现，也不会与蓄力互相打断。
+3. 服务端收到“开始”后记录起始 tick；收到“结束”时用 tick 差算蓄力时长，达到 20 tick 才投掷。
+4. `startCharge` **是幂等的**：按键保持期间客户端会重复发送“开始”边沿，
+   若每次都重置起始 tick，蓄力将永远攒不满（这是修复过程中实际踩到的坑）。
+5. 安全网：`PlayerTickEvent.Post` 每 tick 检查，一旦玩家不再满足“潜行 + 手持长矛 + 存活”，
+   立即丢弃待发的蓄力，不会留下卡住的蓄力状态；`PlayerLoggedOutEvent` 清理离线玩家。
+
 ## 实现要点
 
 - **不替换任何原版内容**：没有新增物品、附魔、配置文件、命令或 GUI；没有修改任何原版物品/实体 ID。
-  投掷能力通过 NeoForge 事件叠加在现有长矛上，
   长矛本身的 `Item` 类、数据组件（`kinetic_weapon`、`piercing_weapon`、`attack_range` …）都不动。
-- **两种输入互不冲突**：监听 `PlayerInteractEvent.RightClickItem`，**只**在“按住 Shift + 手持长矛”时取消该事件，
-  于是这次输入不会触发原版 `Item.use`（举矛），改由本模组在服务端记录蓄力。
-  未按 Shift 时事件完全不干预，原版举矛行为逐字不变。
 - **识别方式**：使用原版物品标签 `minecraft:spears`，因此木/石/铜/铁/金/钻石/下界合金长矛以及
   其它模组按标签加入的长矛都能投掷。
 - **服务端权威**：投掷物实体的生成、直线飞行、碰撞检测与伤害结算**全部在服务端执行**；
-  客户端只保留原版输入处理，并额外注册一个渲染器。专用服务器与单人世界行为一致。
+  客户端只负责输入边沿上报与渲染。专用服务器与单人世界行为一致。
 - **投掷物**：自定义实体 `spearplus:thrown_spear`，继承 `Projectile`。
   - 不受重力影响、速度不衰减（每 tick 直接沿抛出向量平移）。
   - 每 tick 用 `Level.clip` 求飞行线段上的方块命中点，再用射线-AABB 求交收集该线段内**所有**生物，
@@ -38,7 +55,7 @@
 - **渲染**：复用原版长矛的物品模型与贴图（`ItemModelResolver` + `ItemDisplayContext.GROUND`），
   按实体旋转呈现朝向（与三叉戟一致）。**没有新增任何纹理、模型、粒子或音效文件。**
 - **模组 id / 名称**：全流程统一使用 `spearplus` / `Spear Plus`，贯穿 `neoforge.mods.toml`、
-  Java 包名（`com.spearplus`）与注册表命名空间。唯一注册项是投掷物实体类型，ID 稳定，
+  Java 包名（`com.spearplus`）与注册表命名空间。注册项为投掷物实体类型与一个自定义网络载荷，ID 稳定，
   已有存档可直接加载。
 
 ## 构建
@@ -54,7 +71,7 @@ gradlew.bat build
 JAVA_HOME=/path/to/jdk-25 ./gradlew build
 ```
 
-产物：`build/libs/spearplus-1.0.1.jar`
+产物：`build/libs/spearplus-1.0.2.jar`
 
 调试运行：
 
@@ -65,26 +82,30 @@ gradlew.bat runServer     # 专用服务端
 
 ## 手工验收步骤
 
-1. **单人世界**：`/give @s minecraft:iron_spear`，**按住 Shift + 右键**满 1 秒后松手 —— 长矛飞出并击中目标，
-   伤害为铁长矛攻击力 × 1.5（铁长矛 `attack_damage` 为 2.0 + 材料加成，可在 F3+H 高级提示中核对）。
-2. **互不冲突**：不按 Shift 单独按住右键 —— 仍然是原版举矛（蓄力突刺），不会生成投掷物。
-3. **穿透**：`/summon minecraft:pig` 三次排成一线，从侧面投掷 —— 三只全部被穿透并各受一次伤害。
-4. **蓄力未满**：Shift + 右键约 0.5 秒松手 —— 长矛仍在主手，世界中没有投掷物。
-5. **落地保留**：向方块投掷 —— 长矛斜插在落点且一直留在那里；对着远处生物投掷使其穿过后继续飞行，
-   长矛最终仍插在它最后撞到的方块处。
-6. **专用服务器**：两名玩家，A 投掷时 B 能看到飞行中与落地后的长矛，伤害在服务端正确结算。
-7. **旧存档**：装模组前创建的存档直接加载，无注册表或数据错误。
+1. **潜行蓄力**：`/give @s minecraft:iron_spear`，按住 Shift 潜行后按住右键 —— 应进入蓄力，
+   **不出现**原版举矛动作；满 1 秒松开后长矛飞出。
+2. **站立右键**：不按 Shift 单独按住右键 —— 与装模组前完全一致（原版举矛/蓄力突刺），不生成投掷物。
+3. **蓄力未满**：Shift + 右键约 0.5 秒松手 —— 长矛仍在主手，世界中没有投掷物。
+4. **中途取消**：蓄力过程中松开 Shift（或切换物品/打开界面）—— 不投掷，也不残留卡住的蓄力状态。
+5. **伤害与穿透**：`/summon minecraft:pig` 三次排成一线，从侧面投掷 —— 三只全部被穿透并各受一次
+   攻击力 × 1.5 的伤害。
+6. **落地保留**：向方块投掷 —— 长矛斜插在落点且一直留在那里；穿透生物后继续飞行的，
+   仍以最终撞到的方块位置为准。
+7. **其他右键交互**：空手、其他物品、其他武器、右键箱子/工作台等行为不受影响。
+8. **专用服务器**：两名玩家，A 投掷时 B 能看到飞行中与落地后的长矛，伤害在服务端正确结算。
+9. **旧存档**：装模组前创建的存档直接加载，无注册表或数据错误。
 
 ## 目录结构
 
 ```
 src/main/java/com/spearplus/
-  SpearPlus.java               主模组类（模组 id 常量、注册入口）
-  ModEntities.java             投掷物实体类型注册
-  SpearThrowHandler.java       Shift+右键触发、蓄力判定与投掷（服务端）
-  entity/ThrownSpear.java      投掷物实体（飞行、穿透、伤害、落地固定）
-  client/SpearPlusClient.java  客户端渲染器注册
-  client/ThrownSpearRenderer.java
+  SpearPlus.java                  主模组类（模组 id 常量、注册入口、载荷注册）
+  ModEntities.java                投掷物实体类型注册
+  SpearThrowHandler.java          服务端：Shift+右键取消举矛、蓄力计时、投掷
+  network/SpearChargePayload.java 客户端→服务端的蓄力开始/结束边沿
+  entity/ThrownSpear.java         投掷物实体（飞行、穿透、伤害、落地固定）
+  client/SpearThrowClient.java    客户端：原始按键检测、边沿上报、取消举矛
+  client/ThrownSpearRenderer.java 投掷物渲染（复用原版长矛模型贴图）
   client/ThrownSpearRenderState.java
 src/main/resources/META-INF/neoforge.mods.toml
 ```

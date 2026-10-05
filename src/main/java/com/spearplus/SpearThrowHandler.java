@@ -13,82 +13,105 @@ import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResult;
 import net.minecraft.world.item.ItemStack;
 import net.neoforged.bus.api.SubscribeEvent;
+import net.neoforged.neoforge.event.entity.player.PlayerEvent;
 import net.neoforged.neoforge.event.entity.player.PlayerInteractEvent;
 import net.neoforged.neoforge.event.tick.PlayerTickEvent;
 
 /**
  * Turns "hold shift + right-click with a vanilla spear" into a charge, and a full charge into a
- * throw. Everything here is server authoritative: the client only sends its normal input.
+ * throw. Everything here is server authoritative.
  *
  * <p>The vanilla spear keeps its own use action untouched. A plain right-click is never intercepted,
  * so it still performs the vanilla spear raise; only the shift + right-click combination is taken
- * over by this class, which is why the two behaviours cannot interfere with each other.
+ * over, and for that input the vanilla use action is cancelled outright so the raise never plays
+ * and the two behaviours cannot fight each other.
  *
- * <p>The vanilla spear is only ever removed from the inventory when a projectile was actually
- * launched.
+ * <p>Because the vanilla use action is cancelled, the vanilla item-use state is never entered. The
+ * charge therefore has its own lifecycle: the client reports the press/release edges through
+ * {@link com.spearplus.network.SpearChargePayload}, and the server times the charge, validates that
+ * the player is still sneaking and still holding a spear, and only then spawns the projectile.
  */
 public final class SpearThrowHandler {
     /** Ticks of charging required before the release throws. Matches the vanilla bow. */
     public static final int CHARGE_TICKS = 20;
 
-    /** Players currently charging a throw, keyed by player UUID. */
-    private static final Map<UUID, Charge> CHARGES = new HashMap<>();
+    /** Server tick at which each player's charge started, keyed by player UUID. */
+    private static final Map<UUID, Integer> CHARGE_START = new HashMap<>();
 
     private SpearThrowHandler() {
     }
 
-    private record Charge(InteractionHand hand, int ticks) {
-    }
-
     /**
      * Claims the shift + right-click combination for a held spear and swallows the vanilla use
-     * action for that one input, so the vanilla spear raise and the throw never fight each other.
+     * action for that one input, on both the client and the server, so the vanilla spear raise and
+     * the throw never fight each other.
      */
     @SubscribeEvent
     public static void onRightClickItem(PlayerInteractEvent.RightClickItem event) {
-        if (!(event.getEntity() instanceof ServerPlayer player) || !player.isShiftKeyDown()) {
-            return;
-        }
-        if (!isThrowableSpear(event.getItemStack())) {
+        if (!event.getEntity().isShiftKeyDown() || !isThrowableSpear(event.getItemStack())) {
             return;
         }
 
         event.setCanceled(true);
         event.setCancellationResult(InteractionResult.SUCCESS);
-        CHARGES.put(player.getUUID(), new Charge(event.getHand(), 0));
     }
 
-    /** Advances the charge and releases the throw once the use key or shift is let go. */
+    /**
+     * Starts a charge when the client reports the shift + right-click press.
+     *
+     * <p>The client keeps re-sending the press edge for as long as the keys are held, so this is
+     * deliberately idempotent: an already running charge keeps its original start tick, which is
+     * what makes the charge actually accumulate instead of restarting every tick.
+     */
+    public static void startCharge(ServerPlayer player) {
+        if (!canCharge(player) || CHARGE_START.containsKey(player.getUUID())) {
+            return;
+        }
+        CHARGE_START.put(player.getUUID(), player.level().getServer().getTickCount());
+    }
+
+    /** Releases the charge; a charge held long enough throws, anything shorter does nothing. */
+    public static void stopCharge(ServerPlayer player) {
+        Integer start = CHARGE_START.remove(player.getUUID());
+        if (start == null) {
+            return;
+        }
+        int held = player.level().getServer().getTickCount() - start;
+        if (held >= CHARGE_TICKS) {
+            throwSpear(player, InteractionHand.MAIN_HAND);
+        }
+    }
+
+    /**
+     * Safety net for a charge that was never explicitly released: as soon as the player can no
+     * longer charge (let go of shift, swapped the spear away, died), the pending charge is dropped
+     * instead of being left stuck.
+     */
     @SubscribeEvent
     public static void onPlayerTick(PlayerTickEvent.Post event) {
         if (!(event.getEntity() instanceof ServerPlayer player)) {
             return;
         }
-
-        Charge charge = CHARGES.get(player.getUUID());
-        if (charge == null) {
-            return;
+        if (CHARGE_START.containsKey(player.getUUID()) && !canCharge(player)) {
+            CHARGE_START.remove(player.getUUID());
         }
+    }
 
-        // Letting go of either shift or the use key ends the charge; a full charge throws.
-        boolean released = !player.isShiftKeyDown()
-                || !player.isUsingItem()
-                || player.getTicksUsingItem() < charge.ticks();
+    @SubscribeEvent
+    public static void onPlayerLoggedOut(PlayerEvent.PlayerLoggedOutEvent event) {
+        CHARGE_START.remove(event.getEntity().getUUID());
+    }
 
-        CHARGES.remove(player.getUUID());
-        if (released) {
-            if (charge.ticks() >= CHARGE_TICKS) {
-                throwSpear(player, charge.hand());
-            }
-            return;
-        }
-
-        CHARGES.put(player.getUUID(), new Charge(charge.hand(), charge.ticks() + 1));
+    /** The charge is only valid while the player is alive, sneaking and holding a spear. */
+    private static boolean canCharge(ServerPlayer player) {
+        return player.isAlive() && !player.isSpectator()
+                && player.isShiftKeyDown()
+                && isThrowableSpear(player.getMainHandItem());
     }
 
     private static void throwSpear(ServerPlayer player, InteractionHand hand) {
         ItemStack stack = player.getItemInHand(hand);
-        if (!isThrowableSpear(stack) || !(player.level() instanceof ServerLevel serverLevel)) {
+        if (!canCharge(player) || !isThrowableSpear(stack) || !(player.level() instanceof ServerLevel serverLevel)) {
             return;
         }
 
@@ -109,7 +132,7 @@ public final class SpearThrowHandler {
     }
 
     /** True for the vanilla spears only: the {@code minecraft:spears} item tag, nothing else. */
-    private static boolean isThrowableSpear(ItemStack stack) {
+    public static boolean isThrowableSpear(ItemStack stack) {
         return !stack.isEmpty() && stack.is(ItemTags.SPEARS);
     }
 }
