@@ -20,22 +20,25 @@
 
 这是本模组唯一有技巧的部分，记录在此以免后续改动踩坑。
 
-**为什么不能复用原版的使用状态**：原版长矛的“举矛”是由 `Item.use` → `player.startUsingItem` 驱动的。
-需求要求 Shift + 右键时**不出现**举矛动作，因此这个输入必须在 `Item.use` 之前被取消。
-而一旦取消，原版的使用状态（`LivingEntity#isUsingItem` / `getTicksUsingItem`）就永远不会被置位，
-也就无法用来判断“玩家松手了没有”或“蓄力了多久”。**取消原版使用 与 依赖原版使用状态计时，二者不可兼得。**
+**蓄力直接复用原版的使用状态**，不自己计时、不发网络包：
 
-**因此蓄力有自己的一套生命周期**：
+1. Shift + 右键时**不拦截** `Item.use`。原版这次使用动作会调用 `player.startUsingItem`，
+   于是 `LivingEntity#isUsingItem` 与 `getTicksUsingItem` 被正常置位。
+2. 这两个值正是原版长矛手部动画与手持蓄力动画的驱动源：
+   `SpearAnimations` 读取 `HumanoidRenderState#ticksUsingItem` / `isUsingItem`，
+   而它们由客户端的 `isUsingItem` 状态填充。**所以只要让原版使用动作跑起来，
+   手部动画就是原版那一套**，不需要自己写动画。
+3. 客户端松开右键时，原版会发出 `RELEASE_USE_ITEM` 包，服务端触发
+   `LivingEntityUseItemEvent.Stop`，此时 `getTicksUsingItem()` 就是蓄力时长。
+4. 服务端在蓄力期间取消 `LivingEntityUseItemEvent.Tick`。
+   该事件位于 `ItemStack#onUseTick` **之前**，取消它会跳过 `KineticWeapon#damageEntities`，
+   于是**蓄力时不会顺带把面前的生物捅一遍**（原版突刺伤害被抑制），而动画与计时完全不受影响。
+5. 判定条件 `潜行 + isUsingItem + 手持长矛` 三者同时成立才算投掷蓄力：
+   只有潜行不算（站着举矛也会潜行），只有 isUsingItem 也不算（那就是普通举矛）。
 
-1. 客户端 `SpearThrowClient` 直接读原始按键（`options.keyUse` + 潜行状态 + 主手是否为长矛），
-   在“按住/松开”的**边沿**各发一次 `spearplus:spear_charge` 载荷（`SpearChargePayload`）。
-2. 客户端同时取消 `RightClickItem`，服务端 `SpearThrowHandler.onRightClickItem` 也取消一次，
-   于是这条输入不会触发原版 `Item.use`，举矛动作彻底不出现，也不会与蓄力互相打断。
-3. 服务端收到“开始”后记录起始 tick；收到“结束”时用 tick 差算蓄力时长，达到 20 tick 才投掷。
-4. `startCharge` **是幂等的**：按键保持期间客户端会重复发送“开始”边沿，
-   若每次都重置起始 tick，蓄力将永远攒不满（这是修复过程中实际踩到的坑）。
-5. 安全网：`PlayerTickEvent.Post` 每 tick 检查，一旦玩家不再满足“潜行 + 手持长矛 + 存活”，
-   立即丢弃待发的蓄力，不会留下卡住的蓄力状态；`PlayerLoggedOutEvent` 清理离线玩家。
+> 曾经尝试过的错误做法（已废弃，勿重蹈）：为了“不出现举矛动作”而取消 `RightClickItem`，
+> 再自己用按键轮询 + 自定义网络包计时。那样确实不会举矛，但**原版使用状态永远不会置位**，
+> 手部动画就丢了（表现为手臂姿态诡异），还得额外维护按键边沿、幂等起始 tick 和一堆清理逻辑。
 
 ## 实现要点
 
@@ -44,7 +47,7 @@
 - **识别方式**：使用原版物品标签 `minecraft:spears`，因此木/石/铜/铁/金/钻石/下界合金长矛以及
   其它模组按标签加入的长矛都能投掷。
 - **服务端权威**：投掷物实体的生成、直线飞行、碰撞检测与伤害结算**全部在服务端执行**；
-  客户端只负责输入边沿上报与渲染。专用服务器与单人世界行为一致。
+  客户端只负责原版输入与渲染。专用服务器与单人世界行为一致。
 - **投掷物**：自定义实体 `spearplus:thrown_spear`，继承 `Projectile`。
   - 不受重力影响、速度不衰减（每 tick 直接沿抛出向量平移）。
   - 每 tick 用 `Level.clip` 求飞行线段上的方块命中点，再用射线-AABB 求交收集该线段内**所有**生物，
@@ -57,13 +60,16 @@
   - 显示上下文必须用 `ItemDisplayContext.NONE`。原版长矛物品模型对 `gui/ground/fixed/on_shelf`
     选用的是**平面背包贴图**，在三维空间里旋转会像一块翻来翻去的卡片（就是“抖动”的来源）；
     `NONE` 才会落到 3D 的 `*_spear_in_hand` 模型。
-  - 姿态公式与 `ThrownTridentRenderer` 完全一致（相机朝向 → Y 轴 `yRot-90` → Z 轴 `xRot+90`），
-    因为长矛的持握模型与三叉戟模型是同一套坐标约定。
+  - 姿态**只在世界空间构建**（Y 轴 `yRot-90` → Z 轴 `xRot+90`），
+    与 `ThrownTridentRenderer` 的旋转公式一致，因为长矛的持握模型与三叉戟模型是同一套坐标约定。
+  - **绝不能再乘 `camera.orientation`**：渲染管线在调用 `submit` 之前已经应用过相机视图旋转，
+    在 `submit` 里再乘一次等于把它抵消掉，插在地上的矛就会跟着玩家视角转（billboard 化）。
+    这是实际踩到的坑。
   - 渲染器在 `@Mod` 构造函数里用 `modEventBus.addListener` **显式**注册到 mod bus。
     NeoForge 26.3 的 `@EventBusSubscriber` 已没有 `bus` 属性、只会注入 game bus，
     用它注册 `RegisterRenderers` 会静默失效并导致渲染帧 NPE 崩溃。
 - **模组 id / 名称**：全流程统一使用 `spearplus` / `Spear Plus`，贯穿 `neoforge.mods.toml`、
-  Java 包名（`com.spearplus`）与注册表命名空间。注册项为投掷物实体类型与一个自定义网络载荷，ID 稳定，
+  Java 包名（`com.spearplus`）与注册表命名空间。唯一注册项是投掷物实体类型，ID 稳定，
   已有存档可直接加载。
 
 ## 构建
@@ -79,7 +85,7 @@ gradlew.bat build
 JAVA_HOME=/path/to/jdk-25 ./gradlew build
 ```
 
-产物：`build/libs/spearplus-1.0.3.jar`
+产物：`build/libs/spearplus-1.0.4.jar`
 
 调试运行：
 
@@ -111,13 +117,12 @@ gradlew.bat runServer     # 专用服务端
 
 ```
 src/main/java/com/spearplus/
-  SpearPlus.java                  主模组类（模组 id 常量、注册入口、载荷注册）
-  ModEntities.java                投掷物实体类型注册
-  SpearThrowHandler.java          服务端：Shift+右键取消举矛、蓄力计时、投掷
-  network/SpearChargePayload.java 客户端→服务端的蓄力开始/结束边沿
-  entity/ThrownSpear.java         投掷物实体（飞行、穿透、伤害、落地固定）
-  client/SpearThrowClient.java    客户端：原始按键检测、边沿上报、取消举矛
-  client/ThrownSpearRenderer.java 投掷物渲染（复用原版长矛模型贴图）
+  SpearPlus.java                   主模组类（模组 id 常量、注册入口、客户端渲染器注册）
+  ModEntities.java                 投掷物实体类型注册
+  SpearThrowHandler.java           服务端：抑制蓄力期间的突刺伤害、释放时投掷
+  entity/ThrownSpear.java          投掷物实体（飞行、穿透、伤害、落地固定、走近拾取）
+  client/SpearPlusClient.java      客户端渲染器注册（mod bus，显式 addListener）
+  client/ThrownSpearRenderer.java  投掷物渲染（复用原版 3D 长矛模型）
   client/ThrownSpearRenderState.java
 src/main/resources/META-INF/neoforge.mods.toml
 ```

@@ -15,15 +15,18 @@ import net.minecraft.world.phys.AABB;
 /**
  * Renders the thrown spear with the vanilla spear model and texture - no new assets.
  *
+ * <p>The pose is built in world space only. The render pipeline has already applied the camera view
+ * rotation by the time {@code submit} is called, so this method must NOT apply
+ * {@code camera.orientation} again: doing so cancels the view rotation out and makes the spear
+ * follow the player's look direction like a billboard.
+ *
  * <p>The display context is {@link ItemDisplayContext#NONE} on purpose. The vanilla spear item model
  * selects the flat inventory sprite for {@code gui}, {@code ground}, {@code fixed} and
- * {@code on_shelf}, and only falls back to the 3D {@code <material>_spear_in_hand} model for the
- * remaining contexts. Rendering the flat sprite in the world made the spear look like a billboard
- * flipping around as it turned; {@code NONE} resolves the 3D in-hand model instead.
+ * {@code on_shelf}; only the remaining contexts resolve the 3D {@code <material>_spear_in_hand}
+ * model.
  *
- * <p>The pose mirrors {@code ThrownTridentRenderer} exactly (camera orientation, then Y by
- * {@code yRot - 90}, then Z by {@code xRot + 90}), because the spear's in-hand model is authored on
- * the same axis as the trident's model.
+ * <p>The rotations mirror {@code ThrownTridentRenderer}, because the spear's in-hand model is
+ * authored on the same axis as the trident's model.
  */
 public class ThrownSpearRenderer extends EntityRenderer<ThrownSpear, ThrownSpearRenderState> {
     private static final float SCALE = 1.5F;
@@ -39,7 +42,6 @@ public class ThrownSpearRenderer extends EntityRenderer<ThrownSpear, ThrownSpear
     @Override
     public void submit(ThrownSpearRenderState state, PoseStack poseStack, SubmitNodeCollector collector, CameraRenderState camera) {
         poseStack.pushPose();
-        poseStack.rotate(camera.orientation);
         poseStack.rotate(Axis.YP.rotationDegrees(state.yRot - 90.0F));
         poseStack.rotate(Axis.ZP.rotationDegrees(state.xRot + 90.0F));
         poseStack.scale(SCALE, SCALE, SCALE);

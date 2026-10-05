@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.0.4
+
+- 修复插在建筑上的长矛会跟随玩家视角转动的问题。
+  根因：`ThrownSpearRenderer.submit` 里额外乘了一次 `camera.orientation`，
+  而渲染管线在调用 `submit` 之前**已经**应用过相机视图旋转，等于把视图旋转抵消掉，
+  实体就变成了永远正对相机的 billboard。现在姿态只在世界空间构建。
+- 修复蓄力时手部动画怪异的问题。
+  根因：先前为了“不出现举矛动作”取消了 `Item.use`，导致 `isUsingItem` 永不置位，
+  而原版 `SpearAnimations` 正是靠 `HumanoidRenderState#ticksUsingItem` / `isUsingItem` 驱动，
+  于是手臂落回默认姿态。
+  现改为**让原版使用动作正常跑起来**：动画、蓄力进度、释放包全部复用原版；
+  服务端只在蓄力期间取消 `LivingEntityUseItemEvent.Tick`，以抑制原版突刺伤害
+  （该事件位于 `ItemStack#onUseTick` 之前，取消它会跳过 `KineticWeapon#damageEntities`）。
+- 顺带删除不再需要的自定义网络载荷 `spearplus:spear_charge` 与客户端按键轮询，
+  模组回归到"零网络包、零自定义输入"。
+
 ## 1.0.3
 
 - 修复渲染器从未注册导致渲染帧崩溃的问题。
