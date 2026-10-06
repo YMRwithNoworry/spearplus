@@ -36,11 +36,13 @@ import net.minecraft.world.phys.Vec3;
 import org.jspecify.annotations.Nullable;
 
 /**
- * The spear that leaves the player's hand after a full charge.
+ * The spear that leaves the player's hand after a charge.
  *
- * <p>Flight is completely ballistic-free: no gravity, no drag, one straight line along the launch
- * vector. Collision is resolved on the server only, and every living entity whose hitbox is crossed
- * by the swept segment takes the damage once; the projectile is not stopped by the first victim.
+ * <p>Flight is ballistic: a constant downward pull of {@link #GRAVITY} blocks per tick squared, no
+ * drag. The launch speed comes from how long the throw was charged, so a quick tap lobs the spear a
+ * few blocks and a full charge carries it far. Collision is resolved on the server only, and every
+ * living entity whose hitbox is crossed by the swept segment takes the damage once; the projectile
+ * is not stopped by the first victim.
  *
  * <p>The first block hit ends the flight: the spear plants itself into the surface at that exact
  * spot, tilted so it points into the ground, and stays there. It is never consumed, never dropped
@@ -49,8 +51,12 @@ import org.jspecify.annotations.Nullable;
 public class ThrownSpear extends Projectile implements ItemSupplier {
     /** 1.5x the stack's attack-damage attribute value, as specified. */
     public static final float DAMAGE_MULTIPLIER = 1.5F;
-    /** Launch speed in blocks per tick. */
-    public static final float LAUNCH_SPEED = 2.5F;
+    /** Downward acceleration in blocks per tick squared. Same pull the vanilla arrow and trident use. */
+    public static final double GRAVITY = 0.05D;
+    /** Launch speed in blocks per tick for a charge that is released instantly. */
+    public static final float MIN_LAUNCH_SPEED = 0.75F;
+    /** Launch speed in blocks per tick for a full charge. */
+    public static final float MAX_LAUNCH_SPEED = 2.5F;
     /** Hard cap on flight time so a shot that never hits anything still comes down somewhere. */
     private static final int MAX_FLIGHT_TICKS = 200;
     private static final double HITBOX_MARGIN = 0.3D;
@@ -110,12 +116,9 @@ public class ThrownSpear extends Projectile implements ItemSupplier {
             return;
         }
 
-        Vec3 movement = this.getDeltaMovement();
-        if (movement.lengthSqr() < 1.0E-7D) {
-            // Nothing left to travel: plant where it stands rather than leaving a floating spear.
-            this.plant(this.position());
-            return;
-        }
+        Vec3 movement = this.getDeltaMovement().add(0.0D, -GRAVITY, 0.0D);
+        // Keep the field in sync before anything reads it: plant() derives the resting pose from it.
+        this.setDeltaMovement(movement);
 
         if (this.tickCount > MAX_FLIGHT_TICKS) {
             this.plant(this.position());
@@ -136,6 +139,7 @@ public class ThrownSpear extends Projectile implements ItemSupplier {
 
         // Move first so every victim is resolved from the same, final position of this tick.
         this.setPos(to.x, to.y, to.z);
+        this.pointAlong(movement);
 
         for (EntityHitResult hit : hits) {
             this.hitEntity(hit.getEntity());
@@ -144,10 +148,16 @@ public class ThrownSpear extends Projectile implements ItemSupplier {
         if (blockHit.getType() != HitResult.Type.MISS) {
             // The final landing spot is the block impact point, even after piercing other entities.
             this.plant(blockHit.getLocation());
-            return;
         }
+    }
 
-        this.setDeltaMovement(movement);
+    /**
+     * Points the model along the current velocity, so the spear noses over as gravity bends the arc
+     * downwards instead of staying at its launch angle for the whole flight.
+     */
+    private void pointAlong(Vec3 movement) {
+        this.setYRot((float) (Mth.atan2(movement.x, movement.z) * 180.0F / (float) Math.PI));
+        this.setXRot((float) (Mth.atan2(movement.y, movement.horizontalDistance()) * 180.0F / (float) Math.PI));
     }
 
     /**

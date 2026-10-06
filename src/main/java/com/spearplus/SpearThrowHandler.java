@@ -9,6 +9,7 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.sounds.SoundEvents;
 import net.minecraft.sounds.SoundSource;
 import net.minecraft.tags.ItemTags;
+import net.minecraft.util.Mth;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.item.ItemStack;
 import net.neoforged.bus.api.SubscribeEvent;
@@ -17,10 +18,10 @@ import net.neoforged.neoforge.event.entity.player.PlayerInteractEvent;
 import net.neoforged.neoforge.event.tick.PlayerTickEvent;
 
 /**
- * Turns "hold shift + right-click with a vanilla spear" into a charge, and a full charge into a
- * throw.
+ * Turns "hold shift + right-click with a vanilla spear" into a charge, and the release into a throw
+ * whose power follows how long the charge was held.
  *
- * <p>Two rules keep this working without ever fighting the vanilla use-item state, which is the one
+ * <p>Three rules keep this working without ever fighting the vanilla use-item state, which is the one
  * and only driver of the vanilla spear arm pose and in-hand charge animation:
  *
  * <ul>
@@ -29,7 +30,10 @@ import net.neoforged.neoforge.event.tick.PlayerTickEvent;
  *   <li>the server refuses to <b>start</b> the vanilla use for a charging player, which is what
  *       keeps the vanilla kinetic-weapon stab out of a throw charge. The client still starts that
  *       use locally — {@code MultiPlayerGameMode#useItem} calls {@code ItemStack#use} as a
- *       prediction — and that local state is what plays the raise and the sway.</li>
+ *       prediction — and that local state is what animates the charge;</li>
+ *   <li>every release throws: there is no minimum charge, only a launch speed that scales from
+ *       {@link ThrownSpear#MIN_LAUNCH_SPEED} to {@link ThrownSpear#MAX_LAUNCH_SPEED} over
+ *       {@link #FULL_CHARGE_TICKS} ticks.</li>
  * </ul>
  *
  * <p>Suppressing the stab by cancelling {@code LivingEntityUseItemEvent.Tick} instead is <b>not</b>
@@ -40,8 +44,11 @@ import net.neoforged.neoforge.event.tick.PlayerTickEvent;
  * look this class used to produce.
  */
 public final class SpearThrowHandler {
-    /** Ticks of charging required before the release throws. Matches the vanilla bow. */
-    public static final int CHARGE_TICKS = 20;
+    /** Ticks of charging that give a throw its full power. Matches the vanilla bow. */
+    public static final int FULL_CHARGE_TICKS = 20;
+
+    /** A charge older than this is treated as stale (a lost release edge) and dropped. */
+    private static final int MAX_CHARGE_TICKS = 600;
 
     /** Server tick at which each player's charge started, keyed by player UUID. */
     private static final Map<UUID, Integer> CHARGE_START = new HashMap<>();
@@ -49,10 +56,19 @@ public final class SpearThrowHandler {
     private SpearThrowHandler() {
     }
 
-    /** The charge only counts while the player is alive, sneaking and holding a spear. */
+    /** A charge only starts while the player is alive, sneaking and holding a spear. */
     private static boolean canCharge(ServerPlayer player) {
         return player.isAlive() && !player.isSpectator()
                 && player.isShiftKeyDown()
+                && isThrowableSpear(player.getMainHandItem());
+    }
+
+    /**
+     * Releasing is allowed for as long as the player still holds a spear, whether or not they are
+     * still sneaking: every charge throws, only the launch power differs.
+     */
+    private static boolean canThrow(ServerPlayer player) {
+        return player.isAlive() && !player.isSpectator()
                 && isThrowableSpear(player.getMainHandItem());
     }
 
@@ -74,16 +90,18 @@ public final class SpearThrowHandler {
         CHARGE_START.put(player.getUUID(), player.level().getServer().getTickCount());
     }
 
-    /** Releases the charge; a charge held long enough throws, anything shorter does nothing. */
+    /**
+     * Releases the charge. Every charge throws - there is no minimum - and the launch power is the
+     * fraction of {@link #FULL_CHARGE_TICKS} the charge was held for, so a tap lobs the spear a few
+     * blocks while a full second of charging throws it at full speed.
+     */
     public static void stopCharge(ServerPlayer player) {
         Integer start = CHARGE_START.remove(player.getUUID());
         if (start == null) {
             return;
         }
         int held = player.level().getServer().getTickCount() - start;
-        if (held >= CHARGE_TICKS) {
-            throwSpear(player, InteractionHand.MAIN_HAND);
-        }
+        throwSpear(player, InteractionHand.MAIN_HAND, held);
     }
 
     /**
@@ -108,15 +126,20 @@ public final class SpearThrowHandler {
     }
 
     /**
-     * Safety net for a charge that was never explicitly released (the player stopped sneaking, swapped
-     * the spear away, died, or the release edge was lost): drop it instead of leaving it stuck.
+     * Safety net for a charge that can no longer be thrown (the player died, went spectator, or
+     * swapped the spear away) or that was never released at all because the release edge was lost:
+     * drop it instead of leaving it stuck.
      */
     @SubscribeEvent
     public static void onPlayerTick(PlayerTickEvent.Post event) {
         if (!(event.getEntity() instanceof ServerPlayer player)) {
             return;
         }
-        if (isCharging(player) && !canCharge(player)) {
+        Integer start = CHARGE_START.get(player.getUUID());
+        if (start == null) {
+            return;
+        }
+        if (!canThrow(player) || player.level().getServer().getTickCount() - start > MAX_CHARGE_TICKS) {
             CHARGE_START.remove(player.getUUID());
         }
     }
@@ -126,18 +149,25 @@ public final class SpearThrowHandler {
         CHARGE_START.remove(event.getEntity().getUUID());
     }
 
-    private static void throwSpear(ServerPlayer player, InteractionHand hand) {
+    /**
+     * Throws the held spear with the power of {@code heldTicks} of charging: {@code 0} ticks is the
+     * weakest lob, {@link #FULL_CHARGE_TICKS} or more is the full launch speed.
+     */
+    private static void throwSpear(ServerPlayer player, InteractionHand hand, int heldTicks) {
         ItemStack stack = player.getItemInHand(hand);
-        if (!canCharge(player) || !isThrowableSpear(stack) || !(player.level() instanceof ServerLevel serverLevel)) {
+        if (!canThrow(player) || !isThrowableSpear(stack) || !(player.level() instanceof ServerLevel serverLevel)) {
             return;
         }
+
+        float power = Mth.clamp(heldTicks / (float) FULL_CHARGE_TICKS, 0.0F, 1.0F);
+        float speed = Mth.lerp(power, ThrownSpear.MIN_LAUNCH_SPEED, ThrownSpear.MAX_LAUNCH_SPEED);
 
         // The stack is captured before it leaves the inventory: the projectile carries the exact
         // item (enchantments and attributes included) and its damage is read from it later.
         ItemStack projectileStack = stack.copyWithCount(1);
 
         ThrownSpear spear = new ThrownSpear(serverLevel, player, projectileStack);
-        spear.shootFromRotation(player, player.getXRot(), player.getYRot(), 0.0F, ThrownSpear.LAUNCH_SPEED, 0.0F);
+        spear.shootFromRotation(player, player.getXRot(), player.getYRot(), 0.0F, speed, 0.0F);
         serverLevel.addFreshEntity(spear);
 
         stack.shrink(1);
@@ -145,7 +175,7 @@ public final class SpearThrowHandler {
         player.containerMenu.broadcastChanges();
 
         serverLevel.playSound(null, player.getX(), player.getY(), player.getZ(),
-                SoundEvents.TRIDENT_THROW.value(), SoundSource.PLAYERS, 1.0F, 1.0F);
+                SoundEvents.TRIDENT_THROW.value(), SoundSource.PLAYERS, 1.0F, 0.9F + power * 0.2F);
     }
 
     /** True for the vanilla spears only: the {@code minecraft:spears} item tag, nothing else. */

@@ -33,6 +33,7 @@ public final class SpearPlus {
 
         if (FMLEnvironment.getDist() == Dist.CLIENT) {
             modEventBus.addListener(com.spearplus.client.SpearPlusClient::registerRenderers);
+            modEventBus.addListener(com.spearplus.client.SpearPlusClient::registerClientExtensions);
         }
     }
 

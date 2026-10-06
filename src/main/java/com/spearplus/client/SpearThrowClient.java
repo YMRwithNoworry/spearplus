@@ -31,6 +31,11 @@ public final class SpearThrowClient {
     private SpearThrowClient() {
     }
 
+    /** True while the local player is holding a throw charge. Drives the cocked-back charge pose. */
+    public static boolean isCharging() {
+        return charging;
+    }
+
     @SubscribeEvent
     public static void onClientTick(ClientTickEvent.Pre event) {
         Minecraft minecraft = Minecraft.getInstance();
