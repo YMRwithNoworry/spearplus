@@ -12,30 +12,32 @@ import net.minecraft.tags.ItemTags;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.item.ItemStack;
 import net.neoforged.bus.api.SubscribeEvent;
-import net.neoforged.neoforge.event.entity.living.LivingEntityUseItemEvent;
 import net.neoforged.neoforge.event.entity.player.PlayerEvent;
+import net.neoforged.neoforge.event.entity.player.PlayerInteractEvent;
 import net.neoforged.neoforge.event.tick.PlayerTickEvent;
 
 /**
  * Turns "hold shift + right-click with a vanilla spear" into a charge, and a full charge into a
  * throw.
  *
- * <p>The charge is timed by the server from the raw input reported by
- * {@link com.spearplus.network.SpearChargePayload}, not from the vanilla use-item state. That state
- * proved unusable in practice: the client's {@code LocalPlayer#isUsingItem} toggles every tick while
- * the key is held, so {@code getTicksUsingItem()} never accumulates and the release never reaches
- * the throw threshold.
+ * <p>Two rules keep this working without ever fighting the vanilla use-item state, which is the one
+ * and only driver of the vanilla spear arm pose and in-hand charge animation:
  *
- * <p>The vanilla use action is still allowed to run, because it is what produces the vanilla spear
- * arm pose and in-hand charge animation. Two things are layered on top:
  * <ul>
- *   <li>the vanilla kinetic-weapon melee damage is suppressed while a charge is running, so charging
- *       does not also stab whatever is in front of the player;</li>
- *   <li>releasing a charge that ran long enough throws the spear.</li>
+ *   <li>the charge is timed by the server from the raw input reported by
+ *       {@link com.spearplus.network.SpearChargePayload}, never from the vanilla use state;</li>
+ *   <li>the server refuses to <b>start</b> the vanilla use for a charging player, which is what
+ *       keeps the vanilla kinetic-weapon stab out of a throw charge. The client still starts that
+ *       use locally — {@code MultiPlayerGameMode#useItem} calls {@code ItemStack#use} as a
+ *       prediction — and that local state is what plays the raise and the sway.</li>
  * </ul>
  *
- * <p>A plain right-click is never intercepted, so the vanilla spear raise and the throw cannot fight
- * each other: the raise is the same use action, just not converted into a throw without shift.
+ * <p>Suppressing the stab by cancelling {@code LivingEntityUseItemEvent.Tick} instead is <b>not</b>
+ * an option: the NeoForge hook turns a cancelled tick into a use duration of {@code -1}, so
+ * {@code LivingEntity#updateUsingItem} immediately calls {@code completeUsingItem()}. The server
+ * then clears the use flag on every single tick, the client's use state is torn down with it, and
+ * the animation restarts from tick 0 forever — which is exactly the "arm snapping between two poses"
+ * look this class used to produce.
  */
 public final class SpearThrowHandler {
     /** Ticks of charging required before the release throws. Matches the vanilla bow. */
@@ -52,6 +54,11 @@ public final class SpearThrowHandler {
         return player.isAlive() && !player.isSpectator()
                 && player.isShiftKeyDown()
                 && isThrowableSpear(player.getMainHandItem());
+    }
+
+    /** True while this player has a throw charge running. */
+    public static boolean isCharging(ServerPlayer player) {
+        return CHARGE_START.containsKey(player.getUUID());
     }
 
     /**
@@ -80,16 +87,22 @@ public final class SpearThrowHandler {
     }
 
     /**
-     * Suppresses the vanilla kinetic-weapon damage while a throw charge is running, so the charge
-     * does not double as a melee stab. Cancelling this event also skips {@code ItemStack#onUseTick},
-     * which is where the kinetic damage is applied on the server.
+     * Stops the vanilla spear use from starting on the server while the player is charging a throw,
+     * so the charge cannot double as a melee stab. Cancelling here — before {@code Item#use} — leaves
+     * no use state, no use sound and no inventory resync behind.
+     *
+     * <p>Only the server is intercepted. The client has to keep starting the use locally, because
+     * that prediction is what the spear raise/sway animation reads.
      */
     @SubscribeEvent
-    public static void onUseTick(LivingEntityUseItemEvent.Tick event) {
-        if (!(event.getEntity() instanceof ServerPlayer player)) {
+    public static void onRightClickItem(PlayerInteractEvent.RightClickItem event) {
+        if (!(event.getEntity() instanceof ServerPlayer player) || !isThrowableSpear(event.getItemStack())) {
             return;
         }
-        if (CHARGE_START.containsKey(player.getUUID()) && isThrowableSpear(event.getItem())) {
+        // The charge is normally known already: the client sends it from ClientTickEvent.Pre, ahead of
+        // the use packet of the same tick. The sneak check is the fallback for the tick a player presses
+        // shift and right-click together.
+        if (isCharging(player) || player.isShiftKeyDown()) {
             event.setCanceled(true);
         }
     }
@@ -103,7 +116,7 @@ public final class SpearThrowHandler {
         if (!(event.getEntity() instanceof ServerPlayer player)) {
             return;
         }
-        if (CHARGE_START.containsKey(player.getUUID()) && !canCharge(player)) {
+        if (isCharging(player) && !canCharge(player)) {
             CHARGE_START.remove(player.getUUID());
         }
     }
@@ -140,4 +153,3 @@ public final class SpearThrowHandler {
         return !stack.isEmpty() && stack.is(ItemTags.SPEARS);
     }
 }
-

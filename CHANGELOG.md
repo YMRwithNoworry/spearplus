@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.0.6
+
+- 修复蓄力投掷时手部动画仍然怪异的问题（手臂在两种姿态之间每 tick 抖动、举矛动作永远起不来）。
+  根因（读源码确认，1.0.5 只诊断到了一半）：服务端取消 `LivingEntityUseItemEvent.Tick` 时，
+  NeoForge 的 `EventHooks#onItemUseTick` 会返回 **-1**，于是
+  `LivingEntity#updateUsingItem` 里 `--useItemRemaining <= 0` 当场成立并**立刻调用 `completeUsingItem()`**，
+  服务端每 tick 都把使用状态清掉一次；客户端收到同步的标志位后跟着 `stopUsingItem()`，
+  下一 tick 又因为右键仍按住而重新开始使用。于是 `getTicksUsingItem()` 永远停在 1 附近，
+  原版 `SpearAnimations` 的举矛/摆动进度每次都被重置，手臂就在“举矛姿态”和“空手姿态”之间反复横跳。
+- 改为**服务端从一开始就不进入原版使用状态**：在 `PlayerInteractEvent.RightClickItem` 里取消蓄力玩家的这次右键。
+  该事件位于 `Item#use` 之前，取消后既不会留下使用状态，也不会有使用音效和背包重同步；
+  原版突刺（`KineticWeapon#damageEntities`）在蓄力期间因此根本没有机会触发，比“先跑起来再取消”更干净。
+- 客户端的原版使用动作**照常执行**：`MultiPlayerGameMode#useItem` 会预测性地调用 `ItemStack#use`，
+  客户端本地照样 `startUsingItem`，`ticksUsingItem` 从 0 平滑涨到 `delayTicks`（铁矛 12 tick）后进入摆动，
+  举矛动画与第一/第三人称手持动画全部由原版驱动，无需自绘。
+- 客户端上报按键边沿的时机由 `ClientTickEvent.Post` 提前到 `Pre`：
+  同一 tick 内蓄力包先于原版右键包发出，服务端才能可靠地拒绝这次使用
+  （并保留“潜行 + 手持长矛”作为兜底判定）。
+
 ## 1.0.5
 
 - 修复 Shift + 右键蓄力动画闪烁、且永远射不出去的问题。

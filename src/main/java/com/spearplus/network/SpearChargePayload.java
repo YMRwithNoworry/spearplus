@@ -10,10 +10,11 @@ import net.minecraft.resources.Identifier;
 /**
  * Client -> server: the raw "shift + use key" state for the throw charge, sent on every edge.
  *
- * <p>The charge cannot rely on the vanilla use-item state. In practice the client's
- * {@code LocalPlayer#isUsingItem} toggles on and off every tick while the key is held, so
- * {@code getTicksUsingItem()} never accumulates past 1 and the release never reaches the throw
- * threshold. This payload carries the input itself instead, which is stable.
+ * <p>The charge cannot be timed from the vanilla use-item state, because the server deliberately
+ * never enters that state while a charge is running — refusing to start it is how the vanilla
+ * kinetic-weapon stab is kept out of a throw. The state only exists on the client, where it drives
+ * the vanilla spear raise/sway animation. This payload carries the input itself instead, which is
+ * stable and authoritative on the side that actually throws.
  *
  * <p>The vanilla use action is still left running on the client: it is what produces the vanilla
  * spear arm pose and the in-hand charge animation.

@@ -20,25 +20,29 @@
 
 这是本模组唯一有技巧的部分，记录在此以免后续改动踩坑。
 
-**蓄力直接复用原版的使用状态**，不自己计时、不发网络包：
+**服务端不进入原版使用状态，客户端照常进入；蓄力时长由客户端上报的原始按键计时。**
 
-1. Shift + 右键时**不拦截** `Item.use`。原版这次使用动作会调用 `player.startUsingItem`，
-   于是 `LivingEntity#isUsingItem` 与 `getTicksUsingItem` 被正常置位。
-2. 这两个值正是原版长矛手部动画与手持蓄力动画的驱动源：
-   `SpearAnimations` 读取 `HumanoidRenderState#ticksUsingItem` / `isUsingItem`，
-   而它们由客户端的 `isUsingItem` 状态填充。**所以只要让原版使用动作跑起来，
-   手部动画就是原版那一套**，不需要自己写动画。
-3. 客户端松开右键时，原版会发出 `RELEASE_USE_ITEM` 包，服务端触发
-   `LivingEntityUseItemEvent.Stop`，此时 `getTicksUsingItem()` 就是蓄力时长。
-4. 服务端在蓄力期间取消 `LivingEntityUseItemEvent.Tick`。
-   该事件位于 `ItemStack#onUseTick` **之前**，取消它会跳过 `KineticWeapon#damageEntities`，
-   于是**蓄力时不会顺带把面前的生物捅一遍**（原版突刺伤害被抑制），而动画与计时完全不受影响。
-5. 判定条件 `潜行 + isUsingItem + 手持长矛` 三者同时成立才算投掷蓄力：
-   只有潜行不算（站着举矛也会潜行），只有 isUsingItem 也不算（那就是普通举矛）。
+1. 客户端在 `ClientTickEvent.Pre`（**早于**同一 tick 里的右键处理）上报“Shift + 右键 + 手持长矛”的边沿，
+   服务端据此用 tick 差计时，`CHARGE_TICKS = 20`。
+2. 服务端在 `PlayerInteractEvent.RightClickItem` 里**取消蓄力玩家的这次右键**（该事件位于 `Item#use` 之前）。
+   服务端因此从头到尾没有使用状态，原版突刺（`KineticWeapon#damageEntities`）在蓄力期间没有机会触发，
+   也不会有使用音效和背包重同步。
+3. 客户端**不拦截**这次右键：`MultiPlayerGameMode#useItem` 会预测性地调用 `ItemStack#use`，
+   客户端本地照常 `startUsingItem`。而 `SpearAnimations` 读的正是客户端这一份
+   `HumanoidRenderState#isUsingItem` / `ticksUsingItem`，于是举矛、摆动、第一/第三人称手持动画
+   **全部是原版那一套**，不需要自己写动画。
+4. 松开右键时客户端本地结束使用（原版 `releaseUsingItem`），同时发出蓄力结束边沿，服务端满足时长就投掷。
 
-> 曾经尝试过的错误做法（已废弃，勿重蹈）：为了“不出现举矛动作”而取消 `RightClickItem`，
-> 再自己用按键轮询 + 自定义网络包计时。那样确实不会举矛，但**原版使用状态永远不会置位**，
-> 手部动画就丢了（表现为手臂姿态诡异），还得额外维护按键边沿、幂等起始 tick 和一堆清理逻辑。
+> 代价：使用状态只存在于投掷者自己的客户端，**其他玩家看不到蓄力举矛的姿态**（他们只会看到你随后把矛投出去）。
+> 换来的是“蓄力期间绝不会顺带突刺”和“动画 100% 原版、不再每 tick 重置”这两点，对这个模组更划算。
+>
+> **绝对不要在服务端取消 `LivingEntityUseItemEvent.Tick` 来抑制突刺伤害**（1.0.4/1.0.5 就是这么做的）。
+> NeoForge 的 `EventHooks#onItemUseTick` 在事件被取消时返回 `-1`，`LivingEntity#updateUsingItem`
+> 紧接着就会 `--useItemRemaining <= 0` → `completeUsingItem()`，服务端每 tick 清一次使用状态；
+> 客户端被同步的标志位反复打断，`getTicksUsingItem()` 永远停在 1，动画每 tick 重置（表现为手臂抖动）。
+>
+> 也不要为了“不出现举矛动作”而取消客户端的 `RightClickItem`：那样客户端也没有使用状态，
+> 手部动画同样会丢（手臂姿态诡异）。
 
 ## 实现要点
 
@@ -85,7 +89,7 @@ gradlew.bat build
 JAVA_HOME=/path/to/jdk-25 ./gradlew build
 ```
 
-产物：`build/libs/spearplus-1.0.5.jar`
+产物：`build/libs/spearplus-1.0.6.jar`
 
 调试运行：
 
@@ -97,7 +101,8 @@ gradlew.bat runServer     # 专用服务端
 ## 手工验收步骤
 
 1. **潜行蓄力**：`/give @s minecraft:iron_spear`，按住 Shift 潜行后按住右键 —— 应进入蓄力，
-   **不出现**原版举矛动作；满 1 秒松开后长矛飞出。
+   长矛**平滑地举起来并在举满后轻微摆动**（原版长矛蓄力动画，铁矛约 12 tick 举到位），
+   中途不出现手臂抖动或姿态跳变；满 1 秒松开后长矛飞出。
 2. **站立右键**：不按 Shift 单独按住右键 —— 与装模组前完全一致（原版举矛/蓄力突刺），不生成投掷物。
 3. **蓄力未满**：Shift + 右键约 0.5 秒松手 —— 长矛仍在主手，世界中没有投掷物。
 4. **中途取消**：蓄力过程中松开 Shift（或切换物品/打开界面）—— 不投掷，也不残留卡住的蓄力状态。
@@ -119,9 +124,11 @@ gradlew.bat runServer     # 专用服务端
 src/main/java/com/spearplus/
   SpearPlus.java                   主模组类（模组 id 常量、注册入口、客户端渲染器注册）
   ModEntities.java                 投掷物实体类型注册
-  SpearThrowHandler.java           服务端：抑制蓄力期间的突刺伤害、释放时投掷
+  SpearThrowHandler.java           服务端：蓄力计时、拒绝蓄力期间的原版使用（抑制突刺）、释放时投掷
+  network/SpearChargePayload.java  客户端 -> 服务端：Shift + 右键的按键边沿
   entity/ThrownSpear.java          投掷物实体（飞行、穿透、伤害、落地固定、走近拾取）
   client/SpearPlusClient.java      客户端渲染器注册（mod bus，显式 addListener）
+  client/SpearThrowClient.java     客户端：上报蓄力按键边沿（ClientTickEvent.Pre）
   client/ThrownSpearRenderer.java  投掷物渲染（复用原版 3D 长矛模型）
   client/ThrownSpearRenderState.java
 src/main/resources/META-INF/neoforge.mods.toml
